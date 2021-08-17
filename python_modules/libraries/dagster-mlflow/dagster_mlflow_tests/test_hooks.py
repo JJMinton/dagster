@@ -1,34 +1,58 @@
-from unittest.mock import Mock
+from unittest.mock import Mock, MagicMock
+from dagster import Failure, solid, pipeline, ModeDefinition, ResourceDefinition, execute_pipeline, resource
+from dagster.core.execution.context.hook import build_hook_context
 
-from dagster_mlflow.hooks import _cleanup_on_success
+from dagster_mlflow.hooks import _is_last_solid, end_mlflow_run_on_pipeline_finished
+import pytest
 
 
-def test_cleanup_on_success():
+@pytest.fixture
+def mock_solids():
+    return [Mock(name="solid_1"), Mock(name="solid_2")]
 
-    # Given: - two mock solids
-    mock_solid_1 = Mock(name="solid_1")
-    mock_solid_2 = Mock(name="solid_2")
 
-    # - a mock context containing a list of these two solids and a current solid
+@pytest.fixture(scope="function")
+def mock_context(mock_solids):
     mock_context = Mock()
-    step_execution_context = (
-        mock_context._step_execution_context  # pylint: disable=protected-access
+    mock_context._step_execution_context.pipeline_def.solids_in_topological_order = (
+        mock_solids  # pylint: disable=protected-access
     )
-    step_execution_context.pipeline_def.solids_in_topological_order = [
-        mock_solid_1,
-        mock_solid_2,
-    ]
-    mock_context.solid = mock_solid_2
+    return mock_context
 
-    # When: the cleanup function is called with the mock context
-    _cleanup_on_success(mock_context)
 
-    # Then:
-    # - mlflow.end_run is called if solid is the last solid
-    mock_context.resources.mlflow.end_run.assert_called_once()
+def test_is_last_solid(mock_solids, mock_context):
 
-    # - mlflow.end_run is not called when the solid in the context is not the last solid
+    # Check positive case
+    mock_context.solid = mock_solids[-1]
+    assert _is_last_solid(mock_context)
+
+    # Check negative case
     mock_context.reset_mock()
-    mock_context.solid = mock_solid_1
-    _cleanup_on_success(mock_context)
-    mock_context.resources.mlflow.end_run.assert_not_called()
+    mock_context.solid = mock_solids[0]
+    assert not _is_last_solid(mock_context)
+
+
+def test_end_mlflow_run_on_pipeline_finished_no_events():
+    mlflow_mock = Mock()
+    with build_hook_context(resources={"mlflow": mlflow_mock}) as dummy_context:
+        result = end_mlflow_run_on_pipeline_finished(dummy_context, [])
+        assert result.is_skipped == True
+
+
+def test_end_mlflow_run_on_pipeline_finished_success():
+    mlflow_mock = MagicMock()
+    @resource
+    def mlflow_mock_resource():
+        return mlflow_mock
+
+    @solid
+    def dummy_solid():
+        pass
+
+    @end_mlflow_run_on_pipeline_finished
+    @pipeline(mode_defs=[ModeDefinition(resource_defs={"mlflow": mlflow_mock_resource})])
+    def dummy_pipeline():
+        dummy_solid()
+  
+    execute_pipeline(dummy_pipeline, mode="default")
+    mlflow_mock.end_run.assert_called_once()
